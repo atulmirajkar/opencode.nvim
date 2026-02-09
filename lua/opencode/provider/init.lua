@@ -54,6 +54,9 @@
 
 local M = {}
 
+-- Track if cleanup has been run this session
+local cleanup_done = false
+
 ---Get all providers.
 ---@return opencode.Provider[]
 function M.list()
@@ -80,6 +83,16 @@ end
 function M.start()
   local provider = require("opencode.config").provider
   if provider and provider.start then
+    -- Run cleanup once per Neovim session (lazy cleanup on first use)
+    if not cleanup_done and provider.cleanup_orphaned_panes then
+      local count = provider:cleanup_orphaned_panes()
+      if count > 0 then
+        vim.notify("Cleaned up " .. count .. " orphaned OpenCode process(es)", 
+                   vim.log.levels.INFO, { title = "opencode" })
+      end
+      cleanup_done = true
+    end
+    
     -- TODO: Subscribe immediately.
     -- Ideally, providers expose the PID of the process they started.
     -- Then we decompose server.lua code to go PID -> port (OS dependent... windows impl combines this with the PID step currently) -> server -> connect.
@@ -98,6 +111,60 @@ function M.stop()
   else
     error("`provider.stop` unavailable — run `:checkhealth opencode` for details", 0)
   end
+end
+
+---Cleanup orphaned opencode processes via the configured provider.
+function M.cleanup()
+  local provider = require("opencode.config").provider
+  if provider and provider.cleanup_orphaned_panes then
+    local ok, result = pcall(provider.cleanup_orphaned_panes, provider)
+    if ok then
+      local count = result or 0
+      if count > 0 then
+        vim.notify("Cleaned up " .. count .. " orphaned OpenCode pane(s)", vim.log.levels.INFO, { title = "opencode" })
+      else
+        vim.notify("No orphaned OpenCode panes found", vim.log.levels.INFO, { title = "opencode" })
+      end
+    else
+      vim.notify("Cleanup failed: " .. tostring(result), vim.log.levels.ERROR, { title = "opencode" })
+    end
+  else
+    vim.notify("Cleanup not supported by current provider", vim.log.levels.WARN, { title = "opencode" })
+  end
+end
+
+---Check if the provider can auto-start (currently only tmux provider is supported).
+---@return boolean
+function M.can_auto_start()
+  local provider = require("opencode.config").provider
+  if not provider or not provider.start then
+    return false
+  end
+  
+  -- Only auto-start for tmux provider (safest option)
+  if provider.name == "tmux" then
+    return true
+  end
+  
+  return false
+end
+
+---Attach to the tmux pane of the currently connected server (tmux provider only).
+---@return boolean success Whether the attachment was successful
+function M.attach_to_connected_server()
+  local provider = require("opencode.config").provider
+  local connected_server = require("opencode.events").connected_server
+  
+  if not provider or not connected_server then
+    return false
+  end
+  
+  -- Only tmux provider supports attach_to_server
+  if provider.name == "tmux" and type(provider.attach_to_server) == "function" then
+    return provider:attach_to_server(connected_server)
+  end
+  
+  return false
 end
 
 return M

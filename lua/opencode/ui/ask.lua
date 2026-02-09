@@ -71,7 +71,7 @@ function M.ask(default, opts)
   input_opts = vim.tbl_deep_extend("force", input_opts, require("opencode.config").opts.ask.snacks)
 
   require("opencode.cli.server")
-    .get()
+    .get(true, true)  -- Enable auto-start for ask command
     :next(function(server) ---@param server opencode.cli.server.Server
       return server.port
     end)

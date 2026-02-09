@@ -5,6 +5,7 @@ local M = {}
 ---@field port number
 ---@field cwd string
 ---@field title string
+---@field pid number
 
 ---An `opencode` process.
 ---Retrieval is platform-dependent.
@@ -84,8 +85,9 @@ ForEach-Object {
 end
 
 ---@param port number
+---@param pid number
 ---@return Promise<opencode.cli.server.Server>
-local function get_server(port)
+local function get_server(port, pid)
   local Promise = require("opencode.promise")
   return Promise
     .new(function(resolve, reject)
@@ -121,6 +123,7 @@ local function get_server(port)
         port = port,
         cwd = cwd,
         title = title,
+        pid = pid,
       }
     end)
 end
@@ -142,7 +145,7 @@ local function get_all_servers()
     end
   end):next(function(processes) ---@param processes opencode.cli.server.Process[]
     local get_servers = vim.tbl_map(function(process) ---@param process opencode.cli.server.Process
-      return get_server(process.port)
+      return get_server(process.port, process.pid)
     end, processes)
     return Promise.all_settled(get_servers):next(function(results)
       local servers = {}
@@ -158,6 +161,31 @@ local function get_all_servers()
       return servers
     end)
   end)
+end
+
+---Check if a server is in a visible tmux pane (not orphaned)
+---
+---Uses TTY-based detection to determine if an OpenCode process is running
+---in a visible tmux pane. Processes without a TTY or with a TTY not matching
+---any visible pane are considered orphaned.
+---
+---**Windows Compatibility:** This is a tmux-specific feature. On Windows,
+---this always returns true since tmux is not available, meaning all processes
+---will be considered visible (no orphan filtering).
+---
+---@param server opencode.cli.server.Server
+---@return boolean is_visible True if server is in a visible pane (or on Windows)
+local function is_in_visible_pane(server)
+  if is_windows() then
+    return true -- Orphan detection is tmux-only; assume all visible on Windows
+  end
+  
+  if not server.pid then
+    return false
+  end
+  
+  local tmux_util = require("opencode.provider.tmux_util")
+  return tmux_util.is_process_in_visible_pane(server.pid)
 end
 
 ---@return Promise<opencode.cli.server.Server[]>
@@ -178,18 +206,53 @@ local function get_all_servers_in_nvim_cwd()
         table.insert(cwd_matching_servers, server)
       end
     end
-    if #cwd_matching_servers == 0 then
-      error("No `opencode` servers found in Neovim's CWD: " .. nvim_cwd, 0)
+    
+    -- Filter out orphaned servers (not in visible panes)
+    -- Only show servers that can actually be attached to
+    local visible_servers = {}
+    for _, server in ipairs(cwd_matching_servers) do
+      if is_in_visible_pane(server) then
+        table.insert(visible_servers, server)
+      end
     end
-    return cwd_matching_servers
+    
+    if #visible_servers == 0 then
+      error("No `opencode` servers found in visible panes in CWD: " .. nvim_cwd, 0)
+    end
+    return visible_servers
   end)
+end
+
+---Find PID for a given port by searching all opencode processes
+---@param port number
+---@return number|nil pid
+local function find_pid_for_port(port)
+  local processes
+  if is_windows() then
+    processes = get_processes_windows()
+  else
+    processes = get_processes_unix()
+  end
+  
+  for _, process in ipairs(processes) do
+    if process.port == port then
+      return process.pid
+    end
+  end
+  
+  return nil
 end
 
 ---@return Promise<opencode.cli.server.Server>
 local function get_configured_server()
   local configured_port = require("opencode.config").opts.port
   if configured_port then
-    return get_server(configured_port)
+    local pid = find_pid_for_port(configured_port)
+    if pid then
+      return get_server(configured_port, pid)
+    else
+      return require("opencode.promise").reject("No process found for configured port: " .. configured_port)
+    end
   else
     return require("opencode.promise").reject("No configured port for `opencode` server")
   end
@@ -199,7 +262,8 @@ end
 local function get_connected_server()
   local connected_server = require("opencode.events").connected_server
   if connected_server then
-    return get_server(connected_server.port)
+    -- connected_server already has pid, just return it wrapped in a promise
+    return require("opencode.promise").resolve(connected_server)
   else
     return require("opencode.promise").reject("No currently subscribed `opencode` server")
   end
@@ -210,27 +274,81 @@ end
 ---1. The currently subscribed server in `opencode.events`.
 ---2. The configured port in `require("opencode.config").opts.port`.
 ---3. Any server in Neovim's CWD, prompting the user to select if multiple are found.
----4. Calling `require("opencode.provider").start()` to launch a new server, then retrying the above.
+---4. Auto-start a new server if none exist and provider supports it, or show an error.
 ---
 ---Upon success, subscribes to the server's events.
 ---
 ---@param launch boolean? Whether to launch a new server if none found. Defaults to true.
+---@param auto_start boolean? Whether to auto-start without showing picker when no servers exist. Defaults to false.
 ---@return Promise<opencode.cli.server.Server>
-function M.get(launch)
+function M.get(launch, auto_start)
   launch = launch ~= false
+  auto_start = auto_start or false
 
   local Promise = require("opencode.promise")
   return get_connected_server()
     :catch(get_configured_server)
-    :catch(M.select)
+    :catch(function(err)
+      -- Check if any servers exist in CWD
+      return get_all_servers_in_nvim_cwd()
+        :catch(function(no_servers_err)
+          -- No visible servers found in CWD
+          -- This means either no servers exist, or they're all orphaned
+          if auto_start and launch and require("opencode.provider").can_auto_start() then
+            -- Kill any orphaned processes before starting fresh
+            local provider = require("opencode.provider")
+            local config_provider = require("opencode.config").provider
+            if config_provider and config_provider.cleanup_orphaned_panes then
+              local killed = config_provider:cleanup_orphaned_panes()
+              if killed > 0 then
+                vim.notify("Cleaned up " .. killed .. " orphaned OpenCode process(es)", 
+                           vim.log.levels.INFO, { title = "opencode" })
+              end
+            end
+            
+            -- Auto-start provider without showing picker
+            vim.notify("Starting OpenCode server...", vim.log.levels.INFO, { title = "opencode" })
+            return Promise.new(function(resolve, reject)
+              local start_ok, start_result = pcall(provider.start)
+              if not start_ok then
+                return reject("Error starting `opencode`: " .. start_result)
+              end
+
+              -- Wait for the provider to start
+              vim.defer_fn(function()
+                resolve(true)
+              end, 2000)
+            end):next(function()
+              -- After auto-start, directly get the server (should be only one)
+              -- Use select with auto_select_if_one=true to avoid showing picker
+              return get_all_servers_in_nvim_cwd():next(function(servers)
+                if #servers == 1 then
+                  return servers[1]
+                else
+                  -- Multiple servers found, show picker
+                  return M.select()
+                end
+              end)
+            end)
+          else
+            -- Can't auto-start or auto_start disabled, propagate the error
+            return Promise.reject(no_servers_err)
+          end
+        end)
+        :next(function(servers)
+          -- Servers exist in CWD - show picker
+          return M.select()
+        end)
+    end)
     :catch(function(err)
       if not err then
-        -- Do nothing when select is cancelled
+        -- User cancelled the selection
         return Promise.reject()
       end
 
-      return Promise.new(function(resolve, reject)
-        if launch then
+      -- Final fallback: try manual launch if enabled and not already tried
+      if launch and not auto_start then
+        return Promise.new(function(resolve, reject)
           local start_ok, start_result = pcall(require("opencode.provider").start)
           if not start_ok then
             return reject("Error starting `opencode`: " .. start_result)
@@ -240,19 +358,97 @@ function M.get(launch)
           vim.defer_fn(function()
             resolve(true)
           end, 2000)
-        else
-          -- Don't attempt to recover, just propagate the original error
-          reject(err)
-        end
-      end):next(function()
-        -- Retry
-        return M.get(false)
-      end)
+        end):next(function()
+          -- Retry
+          return M.get(false, false)
+        end)
+      else
+        -- Propagate the error
+        return Promise.reject(err)
+      end
     end)
     :next(function(server) ---@param server opencode.cli.server.Server
       require("opencode.events").connect(server)
+      
+      -- If auto_start is enabled (called from ask/prompt), attach to the pane
+      if auto_start then
+        require("opencode.provider").attach_to_connected_server()
+      end
+      
       return server
     end)
+end
+
+---Get the tmux pane ID for a given process ID
+---@param pid number
+---@return string|nil pane_id The tmux pane ID (e.g., "%20") or nil if not found
+local function get_tmux_pane_for_pid(pid)
+  if is_windows() then
+    return nil -- tmux is not available on Windows
+  end
+  
+  -- First, check if the PID is directly a tmux pane's PID
+  local result = vim.system({ "tmux", "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}" }, { text = true }):wait()
+  if result.code == 0 and result.stdout then
+    for line in result.stdout:gmatch("[^\r\n]+") do
+      local pane_pid_str, pane_id = line:match("^(%d+)%s+(.+)$")
+      if pane_pid_str and tonumber(pane_pid_str) == pid then
+        return pane_id
+      end
+    end
+  end
+  
+  -- If not found, check if the PID is a child of a pane's shell
+  -- Get the parent PID
+  local ps_result = vim.system({ "ps", "-o", "ppid=", "-p", tostring(pid) }, { text = true }):wait()
+  if ps_result.code == 0 and ps_result.stdout then
+    local ppid = tonumber(ps_result.stdout:match("^%s*(%d+)"))
+    if ppid then
+      -- Check if the parent is a tmux pane
+      local result2 = vim.system({ "tmux", "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}" }, { text = true }):wait()
+      if result2.code == 0 and result2.stdout then
+        for line in result2.stdout:gmatch("[^\r\n]+") do
+          local pane_pid_str, pane_id = line:match("^(%d+)%s+(.+)$")
+          if pane_pid_str and tonumber(pane_pid_str) == ppid then
+            return pane_id
+          end
+        end
+      end
+    end
+  end
+  
+  return nil
+end
+
+---Check if a server is the one started by the current provider
+---@param server opencode.cli.server.Server
+---@return boolean
+local function is_provider_server(server)
+  local provider = require("opencode.config").provider
+  if not provider then
+    return false
+  end
+  
+  -- Check if provider has a get_port method (e.g., tmux provider)
+  if type(provider.get_port) == "function" then
+    local provider_port = provider:get_port()
+    if provider_port and provider_port == server.port then
+      return true
+    end
+  end
+  
+  return false
+end
+
+---Check if a server is currently connected
+---@param server opencode.cli.server.Server
+---@return boolean
+local function is_connected_server(server)
+  local connected_server = require("opencode.events").connected_server
+  if connected_server and connected_server.port == server.port then
+    return true
+  end
+  return false
 end
 
 ---@param auto_select_if_one boolean?
@@ -269,7 +465,40 @@ function M.select(auto_select_if_one)
     local picker_opts = {
       prompt = "Select an `opencode` server:",
       format_item = function(server) ---@param server opencode.cli.server.Server
-        return string.format("%s | %s | %d", server.title or "<No sessions>", server.cwd, server.port)
+        -- Connection indicator - shows which server we're currently connected to
+        local connection_marker = is_connected_server(server) and "→ " or "  "
+        
+        -- Star marker for provider-started servers
+        local marker = is_provider_server(server) and "★" or " "
+        
+        -- Tmux pane indicator
+        local pane_info = ""
+        if server.pid then
+          local pane_id = get_tmux_pane_for_pid(server.pid)
+          if pane_id then
+            pane_info = string.format("[Tmux %-4s] ", pane_id)
+          else
+            pane_info = "[Unknown]   "
+          end
+        else
+          pane_info = "[Unknown]   "
+        end
+        
+        -- Session title with fixed width
+        local title = server.title or "<No sessions>"
+        
+        -- Shortened CWD with ~/ for home directory
+        local short_cwd = vim.fn.fnamemodify(server.cwd, ":~")
+        
+        return string.format(
+          "%s%s %s%-20s | Port %-5d | %s",
+          connection_marker,
+          marker,
+          pane_info,
+          title,
+          server.port,
+          short_cwd
+        )
       end,
       snacks = {
         layout = {

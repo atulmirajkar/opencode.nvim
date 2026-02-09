@@ -13,6 +13,8 @@ M.command = require("opencode.api.command").command
 M.toggle = require("opencode.provider").toggle
 M.start = require("opencode.provider").start
 M.stop = require("opencode.provider").stop
+M.cleanup = require("opencode.provider").cleanup
+M.attach = require("opencode.ui.select_server").select_server  -- Alias for select_server
 
 M.statusline = require("opencode.status").statusline
 

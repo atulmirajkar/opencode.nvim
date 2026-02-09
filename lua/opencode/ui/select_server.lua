@@ -8,7 +8,10 @@ function M.select_server()
       return server
     end)
     :catch(function(err)
-      vim.notify("Failed to select an `opencode` server: " .. err, vim.log.levels.WARN)
+      if err then
+        vim.notify("Failed to select an `opencode` server: " .. tostring(err), vim.log.levels.WARN)
+      end
+      -- If err is nil, user cancelled - do nothing
     end)
 end
 

@@ -173,6 +173,20 @@ function M.select(opts)
           highlights = { { "Stop opencode", "Comment" } },
           preview = { text = "" },
         })
+        table.insert(items, {
+          __type = "provider",
+          name = "cleanup",
+          text = "Cleanup orphaned opencode panes",
+          highlights = { { "Cleanup orphaned opencode panes", "Comment" } },
+          preview = { text = "" },
+        })
+        table.insert(items, {
+          __type = "provider",
+          name = "attach",
+          text = "Attach to another opencode server",
+          highlights = { { "Attach to another opencode server", "Comment" } },
+          preview = { text = "" },
+        })
       end
 
       -- Server section
@@ -250,6 +264,10 @@ function M.select(opts)
           require("opencode").start()
         elseif choice.name == "stop" then
           require("opencode").stop()
+        elseif choice.name == "cleanup" then
+          require("opencode").cleanup()
+        elseif choice.name == "attach" then
+          require("opencode").attach()
         end
       elseif choice.__type == "server" then
         if choice.name == "select" then

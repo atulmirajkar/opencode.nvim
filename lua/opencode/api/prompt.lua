@@ -25,7 +25,7 @@ function M.prompt(prompt, opts)
 
   local Promise = require("opencode.promise")
   require("opencode.cli.server")
-    .get()
+    .get(true, true)  -- Enable auto-start for prompt command
     :next(function(server) ---@param server opencode.cli.server.Server
       return server.port
     end)
